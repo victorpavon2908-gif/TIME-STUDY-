@@ -104,7 +104,7 @@ class ExcelStudyRepository(private val context: Context) {
                     val row = sheet.getRow(r) ?: sheet.createRow(r)
                     for (c in 0..22) {
                         val cell = row.getCell(c) ?: row.createCell(c)
-                        cell.setBlank()
+                        cell.setCellType(CellType.BLANK)
                     }
                 }
 
@@ -121,7 +121,9 @@ class ExcelStudyRepository(private val context: Context) {
                 if (targetLast < oldLast) {
                     for (r in targetLast + 1..oldLast) {
                         val row = sheet.getRow(r) ?: continue
-                        for (c in 0..22) (row.getCell(c) ?: row.createCell(c)).setBlank()
+                        for (c in 0..22) {
+                            (row.getCell(c) ?: row.createCell(c)).setCellType(CellType.BLANK)
+                        }
                     }
                 }
 
@@ -139,7 +141,11 @@ class ExcelStudyRepository(private val context: Context) {
 
     private fun writeBaseFields(row: Row, item: OperatorStudy) {
         row.cell(0).setCellValue(item.position.toDouble())
-        if (item.operationCode != null) row.cell(1).setCellValue(item.operationCode.toDouble()) else row.cell(1).setBlank()
+        if (item.operationCode != null) {
+            row.cell(1).setCellValue(item.operationCode.toDouble())
+        } else {
+            row.cell(1).setCellType(CellType.BLANK)
+        }
         row.cell(2).setCellValue(item.operation)
         row.cell(3).setCellValue(item.machine)
         row.cell(4).setCellValue(item.employeeCode)
@@ -152,7 +158,7 @@ class ExcelStudyRepository(private val context: Context) {
     private fun writeTimeFields(row: Row, item: OperatorStudy) {
         item.times.forEachIndexed { i, value ->
             val cell = row.cell(9 + i)
-            if (value == null) cell.setBlank() else cell.setCellValue(value)
+            if (value == null) cell.setCellType(CellType.BLANK) else cell.setCellValue(value)
         }
     }
 
@@ -170,11 +176,14 @@ class ExcelStudyRepository(private val context: Context) {
 
         val firstInOperation = index == 0 || all[index - 1].position != all[index].position
         if (!firstInOperation) {
-            row.cell(19).setBlank(); row.cell(20).setBlank(); row.cell(21).setBlank(); row.cell(22).setBlank()
+            row.cell(19).setCellType(CellType.BLANK)
+            row.cell(20).setCellType(CellType.BLANK)
+            row.cell(21).setCellType(CellType.BLANK)
+            row.cell(22).setCellType(CellType.BLANK)
             return
         }
         val endIndex = all.indexOfLastFrom(index) { it.position == all[index].position }
-        val endExcelRow = (documentRow(index = endIndex, dataStart = excelRow - index))
+        val endExcelRow = documentRow(index = endIndex, dataStart = excelRow - index)
         row.cell(19).cellFormula = "\$D\$12"
         row.cell(20).cellFormula = "SUM(Q$excelRow:Q$endExcelRow)*9"
         row.cell(21).cellFormula = "U$excelRow/T$excelRow"
@@ -206,7 +215,10 @@ class ExcelStudyRepository(private val context: Context) {
             val has = row?.let {
                 it.text(2).isNotBlank() || it.text(4).isNotBlank() || it.numericOrNull(0) != null
             } ?: false
-            if (has) { last = r; empty = 0 } else {
+            if (has) {
+                last = r
+                empty = 0
+            } else {
                 empty++
                 if (empty >= 4 && last >= start) break
             }
@@ -217,7 +229,8 @@ class ExcelStudyRepository(private val context: Context) {
     private fun findHeaderRow(sheet: org.apache.poi.ss.usermodel.Sheet): Int {
         for (r in 0..minOf(sheet.lastRowNum, 120)) {
             val row = sheet.getRow(r) ?: continue
-            val texts = (0..minOf(row.lastCellNum.toInt().coerceAtLeast(0), 30)).map { row.text(it).lowercase(Locale.ROOT) }
+            val texts = (0..minOf(row.lastCellNum.toInt().coerceAtLeast(0), 30))
+                .map { row.text(it).lowercase(Locale.ROOT) }
             val hasT1 = texts.any { it.startsWith("t1") }
             val hasOperator = texts.any { it.contains("operarios") || it == "operario" }
             if (hasT1 && hasOperator) return r
@@ -226,7 +239,13 @@ class ExcelStudyRepository(private val context: Context) {
     }
 
     private fun queryName(uri: Uri): String? {
-        context.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+        context.contentResolver.query(
+            uri,
+            arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+            null,
+            null,
+            null
+        )?.use { c ->
             if (c.moveToFirst()) return c.getString(0)
         }
         return null
@@ -236,13 +255,13 @@ class ExcelStudyRepository(private val context: Context) {
 
     private fun Row.text(index: Int): String {
         val cell = getCell(index) ?: return ""
-        return when (cell.cellType) {
+        return when (cell.cellTypeEnum) {
             CellType.STRING -> cell.stringCellValue
             CellType.NUMERIC -> {
                 val n = cell.numericCellValue
                 if (n % 1.0 == 0.0) n.toLong().toString() else n.toString()
             }
-            CellType.FORMULA -> when (cell.cachedFormulaResultType) {
+            CellType.FORMULA -> when (cell.cachedFormulaResultTypeEnum) {
                 CellType.STRING -> cell.stringCellValue
                 CellType.NUMERIC -> cell.numericCellValue.toString()
                 else -> ""
@@ -253,10 +272,12 @@ class ExcelStudyRepository(private val context: Context) {
 
     private fun Row.numericOrNull(index: Int): Double? {
         val cell = getCell(index) ?: return null
-        return when (cell.cellType) {
+        return when (cell.cellTypeEnum) {
             CellType.NUMERIC -> cell.numericCellValue
             CellType.STRING -> cell.stringCellValue.replace(',', '.').toDoubleOrNull()
-            CellType.FORMULA -> if (cell.cachedFormulaResultType == CellType.NUMERIC) cell.numericCellValue else null
+            CellType.FORMULA -> {
+                if (cell.cachedFormulaResultTypeEnum == CellType.NUMERIC) cell.numericCellValue else null
+            }
             else -> null
         }
     }
