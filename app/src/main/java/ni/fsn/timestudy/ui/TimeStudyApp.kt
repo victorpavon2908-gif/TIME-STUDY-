@@ -98,6 +98,7 @@ private fun HomeScreen(loading: Boolean, onImport: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun StudyScreen(state: UiState, vm: StudyViewModel, onExport: () -> Unit) {
     val doc = state.document ?: return
