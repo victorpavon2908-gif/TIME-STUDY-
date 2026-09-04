@@ -4,14 +4,20 @@ import android.content.Context
 import android.net.Uri
 import ni.fsn.timestudy.model.OperatorStudy
 import ni.fsn.timestudy.model.StudyDocument
-import org.apache.poi.ss.usermodel.Cell
 import org.apache.poi.ss.usermodel.CellType
 import org.apache.poi.ss.usermodel.Row
 import org.apache.poi.ss.usermodel.WorkbookFactory
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.math.BigDecimal
 import java.util.Locale
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
 
 class ExcelStudyRepository(private val context: Context) {
     private var workingFile: File? = null
@@ -42,6 +48,7 @@ class ExcelStudyRepository(private val context: Context) {
                     val pos = row?.numericOrNull(0)?.toInt()
                     val op = row?.text(2).orEmpty().trim()
                     val employee = row?.text(4).orEmpty().trim()
+
                     if (pos == null && op.isBlank() && employee.isBlank()) {
                         emptyStreak++
                         if (emptyStreak >= 4 && result.isNotEmpty()) break
@@ -67,6 +74,7 @@ class ExcelStudyRepository(private val context: Context) {
 
                 val line = sheet.getRow(6)?.text(2).orEmpty()
                 val style = sheet.getRow(7)?.text(2).orEmpty()
+
                 return StudyDocument(
                     displayName = name,
                     sheetName = sheet.sheetName,
@@ -81,149 +89,225 @@ class ExcelStudyRepository(private val context: Context) {
     }
 
     /**
-     * Exporta partiendo del XLSX original. Sólo se reescribe el bloque de detalle A:W.
-     * Las demás hojas, imágenes, estilos y configuración del libro se conservan.
+     * Exportación en modo "overlay".
+     *
+     * IMPORTANTE: aquí NO se vuelve a guardar el libro con Apache POI.
+     * El XLSX original se copia como paquete ZIP y sólo se modifican las celdas
+     * de captura de datos de la hoja del estudio:
+     *
+     * E = código del trabajador
+     * F = antigüedad
+     * G = tiempo FSN
+     * H = tiempo en operación
+     * J:N = t1..t5
+     *
+     * No se modifica ninguna fórmula, borde, estilo, alto de fila, ancho de
+     * columna, gráfico, imagen, vínculo, hoja ni configuración del libro.
+     * La columna I (Operario) tampoco se toca porque en el formato original
+     * contiene una fórmula VLOOKUP dependiente del código de la columna E.
      */
     fun exportWorkbook(document: StudyDocument, outputUri: Uri) {
         val source = requireNotNull(workingFile) { "No hay un archivo activo" }
-        FileInputStream(source).use { input ->
-            WorkbookFactory.create(input).use { wb ->
-                val sheet = wb.getSheet(document.sheetName)
-                    ?: error("No existe la hoja ${document.sheetName}")
 
-                val rows = document.visibleOperators
-                val start = document.dataStartRow
-                val oldLast = detectLastStudyRow(sheet, start)
-                val targetLast = start + rows.lastIndex
-                val clearTo = maxOf(oldLast, targetLast)
+        val addedRows = document.operators.filter { !it.deleted && it.originalRow == null }
+        require(addedRows.isEmpty()) {
+            "Hay operarios agregados que todavía no tienen una fila física en el Excel. " +
+                "Para proteger fórmulas y formato no se insertarán filas automáticamente en esta exportación."
+        }
 
-                // Conservamos una fila plantilla con formato antes de limpiar.
-                val styleTemplate = sheet.getRow(start)
+        val worksheetEntry = locateWorksheetEntry(source, document.sheetName)
 
-                for (r in start..clearTo) {
-                    val row = sheet.getRow(r) ?: sheet.createRow(r)
-                    for (c in 0..22) {
-                        val cell = row.getCell(c) ?: row.createCell(c)
-                        cell.setCellType(CellType.BLANK)
-                    }
-                }
+        context.contentResolver.openOutputStream(outputUri, "w").use { rawOutput ->
+            requireNotNull(rawOutput) { "No se pudo crear el archivo de salida" }
 
-                rows.forEachIndexed { index, item ->
-                    val r = start + index
-                    val row = sheet.getRow(r) ?: sheet.createRow(r)
-                    if (styleTemplate != null && r != start) cloneRowStyle(styleTemplate, row)
-                    writeBaseFields(row, item)
-                    writeTimeFields(row, item)
-                    writeDetailFormulas(row, r + 1, rows, index)
-                }
+            ZipInputStream(BufferedInputStream(FileInputStream(source))).use { zipIn ->
+                ZipOutputStream(BufferedOutputStream(rawOutput)).use { zipOut ->
+                    var foundWorksheet = false
+                    var entry = zipIn.nextEntry
 
-                // Limpia filas sobrantes de un estudio más largo previo.
-                if (targetLast < oldLast) {
-                    for (r in targetLast + 1..oldLast) {
-                        val row = sheet.getRow(r) ?: continue
-                        for (c in 0..22) {
-                            (row.getCell(c) ?: row.createCell(c)).setCellType(CellType.BLANK)
+                    while (entry != null) {
+                        val outEntry = ZipEntry(entry.name).apply {
+                            if (entry.time >= 0L) time = entry.time
                         }
+                        zipOut.putNextEntry(outEntry)
+
+                        if (entry.name == worksheetEntry) {
+                            foundWorksheet = true
+                            val originalXml = zipIn.readBytes().toString(Charsets.UTF_8)
+                            val patchedXml = patchStudySheet(originalXml, document)
+                            zipOut.write(patchedXml.toByteArray(Charsets.UTF_8))
+                        } else {
+                            zipIn.copyTo(zipOut)
+                        }
+
+                        zipOut.closeEntry()
+                        zipIn.closeEntry()
+                        entry = zipIn.nextEntry
+                    }
+
+                    require(foundWorksheet) {
+                        "No se encontró la hoja ${document.sheetName} dentro del archivo XLSX"
                     }
                 }
+            }
+        }
+    }
 
-                // Deja el cálculo para Excel al abrir el archivo.
-                wb.creationHelper.createFormulaEvaluator().clearAllCachedResultValues()
-                wb.setForceFormulaRecalculation(true)
+    private fun patchStudySheet(originalXml: String, document: StudyDocument): String {
+        var xml = originalXml
 
-                context.contentResolver.openOutputStream(outputUri, "w").use { output ->
-                    requireNotNull(output) { "No se pudo crear el archivo" }
-                    wb.write(output)
+        document.operators.forEach { item ->
+            val zeroBasedRow = item.originalRow ?: return@forEach
+            val excelRow = zeroBasedRow + 1
+
+            if (item.deleted) {
+                // Eliminar un operario significa vaciar únicamente los datos capturables.
+                // La fila, sus fórmulas y su formato permanecen exactamente en su lugar.
+                listOf("E", "F", "G", "H").forEach { col ->
+                    xml = patchStringCell(xml, "$col$excelRow", "")
                 }
+                listOf("J", "K", "L", "M", "N").forEach { col ->
+                    xml = patchNumericCell(xml, "$col$excelRow", null)
+                }
+                return@forEach
+            }
+
+            xml = patchStringCell(xml, "E$excelRow", item.employeeCode)
+            xml = patchStringCell(xml, "F$excelRow", item.seniority)
+            xml = patchStringCell(xml, "G$excelRow", item.timeFsn)
+            xml = patchStringCell(xml, "H$excelRow", item.timeOperation)
+
+            item.times.forEachIndexed { index, value ->
+                val column = ('J'.code + index).toChar()
+                xml = patchNumericCell(xml, "$column$excelRow", value)
             }
         }
+
+        return xml
     }
 
-    private fun writeBaseFields(row: Row, item: OperatorStudy) {
-        row.cell(0).setCellValue(item.position.toDouble())
-        if (item.operationCode != null) {
-            row.cell(1).setCellValue(item.operationCode.toDouble())
+    /**
+     * Sustituye sólo el contenido de una celda existente.
+     * Si por seguridad detecta que esa celda contiene una fórmula, no la toca.
+     * Conserva atributos como r= y s=, por lo que el estilo/borde original queda intacto.
+     */
+    private fun patchStringCell(xml: String, cellRef: String, value: String): String {
+        val match = findCell(xml, cellRef)
+            ?: error("No encontré la celda $cellRef en el formato original")
+
+        if (containsFormula(match.value)) return xml
+
+        val startTag = normalizedStartTag(match.value, cellType = if (value.isBlank()) null else "inlineStr")
+        val replacement = if (value.isBlank()) {
+            "$startTag</c>"
         } else {
-            row.cell(1).setCellType(CellType.BLANK)
-        }
-        row.cell(2).setCellValue(item.operation)
-        row.cell(3).setCellValue(item.machine)
-        row.cell(4).setCellValue(item.employeeCode)
-        row.cell(5).setCellValue(item.seniority)
-        row.cell(6).setCellValue(item.timeFsn)
-        row.cell(7).setCellValue(item.timeOperation)
-        row.cell(8).setCellValue(item.operatorName)
-    }
-
-    private fun writeTimeFields(row: Row, item: OperatorStudy) {
-        item.times.forEachIndexed { i, value ->
-            val cell = row.cell(9 + i)
-            if (value == null) cell.setCellType(CellType.BLANK) else cell.setCellValue(value)
-        }
-    }
-
-    private fun writeDetailFormulas(
-        row: Row,
-        excelRow: Int,
-        all: List<OperatorStudy>,
-        index: Int
-    ) {
-        row.cell(14).cellFormula = "IFERROR(AVERAGE(J$excelRow:N$excelRow),\"\")"
-        row.cell(15).cellFormula = "IFERROR(3600/O$excelRow,\"\")"
-        row.cell(16).cellFormula = "3600*(1-20%)/O$excelRow"
-        row.cell(17).cellFormula = "IFERROR(VLOOKUP(A$excelRow,\$A\$19:\$H\$34,8,0),\"\")"
-        row.cell(18).cellFormula = "IFERROR(Q$excelRow/R$excelRow,\"\")"
-
-        val firstInOperation = index == 0 || all[index - 1].position != all[index].position
-        if (!firstInOperation) {
-            row.cell(19).setCellType(CellType.BLANK)
-            row.cell(20).setCellType(CellType.BLANK)
-            row.cell(21).setCellType(CellType.BLANK)
-            row.cell(22).setCellType(CellType.BLANK)
-            return
-        }
-        val endIndex = all.indexOfLastFrom(index) { it.position == all[index].position }
-        val endExcelRow = documentRow(index = endIndex, dataStart = excelRow - index)
-        row.cell(19).cellFormula = "\$D\$12"
-        row.cell(20).cellFormula = "SUM(Q$excelRow:Q$endExcelRow)*9"
-        row.cell(21).cellFormula = "U$excelRow/T$excelRow"
-        row.cell(22).cellFormula = "AVERAGE(O$excelRow:O$endExcelRow)"
-    }
-
-    private fun documentRow(index: Int, dataStart: Int): Int = dataStart + index
-
-    private inline fun <T> List<T>.indexOfLastFrom(start: Int, predicate: (T) -> Boolean): Int {
-        var i = start
-        while (i + 1 < size && predicate(this[i + 1])) i++
-        return i
-    }
-
-    private fun cloneRowStyle(source: Row, target: Row) {
-        target.height = source.height
-        for (c in 0..22) {
-            val src = source.getCell(c) ?: continue
-            val dst = target.getCell(c) ?: target.createCell(c)
-            dst.cellStyle = src.cellStyle
-        }
-    }
-
-    private fun detectLastStudyRow(sheet: org.apache.poi.ss.usermodel.Sheet, start: Int): Int {
-        var last = start - 1
-        var empty = 0
-        for (r in start..sheet.lastRowNum) {
-            val row = sheet.getRow(r)
-            val has = row?.let {
-                it.text(2).isNotBlank() || it.text(4).isNotBlank() || it.numericOrNull(0) != null
-            } ?: false
-            if (has) {
-                last = r
-                empty = 0
+            val preserve = if (value.firstOrNull()?.isWhitespace() == true || value.lastOrNull()?.isWhitespace() == true) {
+                " xml:space=\"preserve\""
             } else {
-                empty++
-                if (empty >= 4 && last >= start) break
+                ""
             }
+            "$startTag<is><t$preserve>${escapeXml(value)}</t></is></c>"
         }
-        return maxOf(last, start)
+
+        return xml.replaceRange(match.range, replacement)
+    }
+
+    private fun patchNumericCell(xml: String, cellRef: String, value: Double?): String {
+        val match = findCell(xml, cellRef)
+            ?: error("No encontré la celda $cellRef en el formato original")
+
+        if (containsFormula(match.value)) return xml
+
+        val startTag = normalizedStartTag(match.value, cellType = null)
+        val replacement = if (value == null) {
+            "$startTag</c>"
+        } else {
+            "$startTag<v>${formatNumber(value)}</v></c>"
+        }
+
+        return xml.replaceRange(match.range, replacement)
+    }
+
+    private fun findCell(xml: String, cellRef: String): MatchResult? {
+        val ref = Regex.escape(cellRef)
+        val pattern = Regex(
+            "<c\\b[^>]*\\br=\"$ref\"[^>]*(?:/>|>.*?</c>)",
+            setOf(RegexOption.DOT_MATCHES_ALL)
+        )
+        return pattern.find(xml)
+    }
+
+    private fun containsFormula(cellXml: String): Boolean =
+        Regex("<f(?:\\s|>)").containsMatchIn(cellXml)
+
+    private fun normalizedStartTag(cellXml: String, cellType: String?): String {
+        val raw = if (cellXml.contains("/>" ) && !cellXml.contains("</c>")) {
+            cellXml.substringBefore("/>")
+        } else {
+            cellXml.substringBefore('>')
+        }
+
+        var tag = raw.removeSuffix("/")
+        tag = tag.replace(Regex("\\s+t=\"[^\"]*\""), "")
+
+        if (cellType != null) {
+            tag += " t=\"$cellType\""
+        }
+
+        return "$tag>"
+    }
+
+    private fun formatNumber(value: Double): String =
+        BigDecimal.valueOf(value).stripTrailingZeros().toPlainString()
+
+    private fun escapeXml(value: String): String = value
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+
+    private fun locateWorksheetEntry(file: File, sheetName: String): String {
+        val workbookXml = readZipText(file, "xl/workbook.xml")
+        val relationshipsXml = readZipText(file, "xl/_rels/workbook.xml.rels")
+
+        val sheetTag = Regex("<sheet\\b[^>]*/?>")
+            .findAll(workbookXml)
+            .firstOrNull { xmlAttribute(it.value, "name") == sheetName }
+            ?.value
+            ?: error("No encontré la hoja $sheetName en workbook.xml")
+
+        val relationshipId = xmlAttribute(sheetTag, "r:id")
+            ?: error("La hoja $sheetName no tiene relación interna")
+
+        val relationshipTag = Regex("<Relationship\\b[^>]*/?>")
+            .findAll(relationshipsXml)
+            .firstOrNull { xmlAttribute(it.value, "Id") == relationshipId }
+            ?.value
+            ?: error("No encontré la relación $relationshipId de la hoja $sheetName")
+
+        val target = xmlAttribute(relationshipTag, "Target")
+            ?: error("La relación $relationshipId no tiene destino")
+
+        return when {
+            target.startsWith("/") -> target.removePrefix("/")
+            target.startsWith("xl/") -> target
+            else -> "xl/${target.removePrefix("./")}" 
+        }
+    }
+
+    private fun xmlAttribute(tag: String, name: String): String? {
+        val escapedName = Regex.escape(name)
+        return Regex("(?:\\s|^)$escapedName=\"([^\"]*)\"")
+            .find(tag)
+            ?.groupValues
+            ?.getOrNull(1)
+    }
+
+    private fun readZipText(file: File, entryName: String): String {
+        ZipFile(file).use { zip ->
+            val entry = zip.getEntry(entryName)
+                ?: error("El XLSX no contiene $entryName")
+            return zip.getInputStream(entry).bufferedReader(Charsets.UTF_8).use { it.readText() }
+        }
     }
 
     private fun findHeaderRow(sheet: org.apache.poi.ss.usermodel.Sheet): Int {
@@ -250,8 +334,6 @@ class ExcelStudyRepository(private val context: Context) {
         }
         return null
     }
-
-    private fun Row.cell(index: Int): Cell = getCell(index) ?: createCell(index)
 
     private fun Row.text(index: Int): String {
         val cell = getCell(index) ?: return ""
