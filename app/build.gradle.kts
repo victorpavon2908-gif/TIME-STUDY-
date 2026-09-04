@@ -58,8 +58,7 @@ dependencies {
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
-    // Apache POI para abrir y guardar el mismo XLSX manteniendo formato y fórmulas.
-    // En Android se usa la adaptación publicada en JitPack.
-    implementation("com.github.slui861.poi-android:poi:5.2.3")
-    compileOnly("org.apache.poi:poi-ooxml:5.2.3")
+    // Apache POI adaptado para Android. Esta versión existe en JitPack y
+    // evita depender del artefacto inexistente slui861:5.2.3.
+    implementation("com.github.SUPERCILEX.poi-android:poi:3.17")
 }
